@@ -1,69 +1,200 @@
-Automated Quality Gate for AEM Cloud
-1. Executive Summary
-This design defines an automated release workflow that integrates Adobe Cloud Manager (ACM) with an external Jenkins environment. The goal is to enforce a strict quality gate: code is only promoted to the QA environment after it has successfully passed automated regression testing in the Development environment.
-2. Architecture Diagram
-This diagram illustrates the separation of concerns. Adobe manages the hosting/deployment, while Jenkins manages the quality decision.
-'''
-graph TD
-    %% Nodes
-    subgraph Adobe_Cloud_Platform ["Adobe Ecosystem"]
-        AEM_Dev[AEM Dev Environment]
-        AEM_QA[AEM QA Environment]
-        ACM[Adobe Cloud Manager (CI/CD)]
-    end
+High-Level Design — Pull Model Using Adobe Journaling API
+Overview
 
-    subgraph Corporate_Network ["Corporate Infrastructure"]
-        Jenkins[Jenkins Orchestrator]
-        Dashboard[Test Dashboard]
-    end
+Instead of Adobe Cloud Manager pushing webhook events directly into Jenkins, Jenkins (or a small polling service) periodically pulls deployment-related events from the Adobe I/O Journaling API. Jenkins processes these events, determines which ones are new and relevant, and triggers the correct regression/QA pipelines.
 
-    %% Flow
-    Start((Dev Commit)) -->|1. Triggers| ACM
-    ACM -->|2. Deploys Code| AEM_Dev
-    
-    AEM_Dev -.->|3. Webhook Trigger| Jenkins
-    
-    Jenkins -->|4. Runs Regression Suite| AEM_Dev
-    Jenkins -->|5. Publishes Results| Dashboard
-    
-    Jenkins -->|6. If PASS: API Trigger| ACM
-    ACM -->|7. Promotes Code| AEM_QA
-    
-    %% Styling
-    style Jenkins fill:#f9f,stroke:#333,stroke-width:2px
-    style ACM fill:#ccf,stroke:#333,stroke-width:2px
-    style AEM_Dev fill:#dfd,stroke:#333
-    style AEM_QA fill:#dfd,stroke:#333
-'''
-3. Workflow Description
-Phase 1: The Development Deployment
-• Trigger: A developer commits code to the AEM Cloud Git repository.
-• Action: Adobe Cloud Manager (ACM) automatically starts the Dev Pipeline.
-• Outcome: The code is built and deployed to the AEM Dev environment.
-Phase 2: The Handshake (Adobe to Jenkins)
-• Trigger: The ACM Dev Pipeline finishes successfully.
-• Mechanism: An Adobe I/O Event (Webhook) is fired.
-• Action: The Webhook hits a specific URL on the Jenkins server. This tells Jenkins: "New code is ready on Dev. Start testing."
-Phase 3: The Quality Gate (Testing)
-• Action: Jenkins checks out the regression test code (e.g., Selenium/Cypress).
-• Execution: Jenkins runs the tests against the live AEM Dev Environment URL.
-• Reporting: As tests run, results are sent to the Dashboard (e.g., SonarQube, Allure, or a simple HTML report).
-Phase 4: The Decision (Jenkins to Adobe)
-• Scenario A: Tests FAIL
-• Jenkins marks the job as Failed.
-• Notifications are sent to the team.
-• The Process Stops. (Nothing moves to QA).
-• Scenario B: Tests PASS (The Happy Path)
-• Jenkins authenticates with Adobe using a secure API Key.
-• Jenkins sends a command to the Adobe Cloud Manager API.
-• Command: "Start the QA Pipeline."
-Phase 5: QA Deployment
-• Action: Adobe Cloud Manager receives the API call.
-• Outcome: ACM starts the deployment to the QA Environment.
-4. Key Technical Components
-To build this, you need three specific integration points:
+This model avoids exposing Jenkins publicly and allows full control over polling frequency, deduplication, and event filtering.
 
-5. Security & Network Considerations (The Basics)
-Since AEM is in the Cloud and Jenkins is on your network, we must ensure they can talk to each other:
-1. Ingress (Adobe -> Jenkins): Your Jenkins instance must be accessible via a public URL (or a secure tunnel) so Adobe's webhook can reach it.
-2. Egress (Jenkins -> Adobe): Your Jenkins agent needs internet access to hit the AEM Dev URL (for testing) and the Adobe API (for triggering QA).
+Phase 1 — Event Collection & Filtering
+Step 1 — Adobe Cloud Manager Deployment Produces Events
+
+Each deployment in Cloud Manager (Dev, QA, Stage, Prod) generates multiple internal events.
+
+Adobe I/O consolidates them into a Journaling Endpoint.
+
+Example Journaling API endpoint format:
+
+https://eventsingress.adobe.io/{journal_id}
+
+
+Access requires an Adobe Developer Console integration with:
+
+Service Account (JWT or OAuth Server-to-Server)
+
+Workspace with Cloud Manager Events enabled
+
+Step 2 — Polling Service Authenticates & Calls Journaling API
+
+A lightweight polling service (Python, Node.js, Cloud Run, or Jenkins scheduled job) calls the Journaling API:
+
+Example:
+
+GET https://eventsingress.adobe.io/{journal_id}?since={cursor}
+Authorization: Bearer <access_token>
+x-api-key: <client_id>
+
+
+Corporate whitelisting note:
+
+Only outbound access is required.
+
+The polling service's IP may need to be whitelisted in the corporate network firewall to reach Adobe.
+
+Step 3 — Retrieve Only New Events
+
+Adobe Journaling API supports incremental reads using the “cursor” mechanism.
+
+Each response includes a next cursor.
+
+The polling service stores this cursor (e.g., Cloud Storage bucket, Redis, Jenkins workspace).
+
+Ensures:
+
+No re-reading old events
+
+No duplicate triggers
+
+Efficient reads even if there are hundreds of events
+
+Step 4 — Local Filtering of Relevant Events
+
+The polling service filters for:
+
+Only Cloud Manager events
+
+Only deployment.finished or deployment.started
+
+Only the target environment (dev, qa, etc.)
+
+Only successful deployments
+
+Example event fields used:
+
+event.type
+event.environment.name
+event.deploymentId
+event.pipelineId
+event.status
+
+Step 5 — Select Only the Latest Deployment Event
+
+In case multiple deployments occurred:
+
+Group events by environment (e.g., Dev)
+
+Sort by timestamp
+
+Pick the newest event that is not yet processed
+
+Maintain a local “processed deployment IDs” cache (state file, Redis, database)
+
+This ensures:
+
+Tests are only triggered once per deployment
+
+Old or duplicate events are ignored
+
+Phase 2 — Test Execution Triggering
+Step 6 — Polling Service Triggers Jenkins
+
+Once a new “latest” deployment event is detected:
+
+Trigger options:
+
+Option A — Call Jenkins REST API
+POST https://jenkins.example.com/job/<pipeline>/buildWithParameters
+
+Option B — Use Generic Webhook Trigger plugin
+POST https://jenkins.example.com/generic-webhook-trigger/invoke?token=<secure_token>
+Content-Type: application/json
+
+{
+  "environment": "dev",
+  "deploymentId": "abc123",
+  "timestamp": "2025-01-20T12:45:00Z",
+  "eventType": "dev_deployment_finished"
+}
+
+
+Jenkins remains internal; only outbound access is required.
+
+Step 7 — Jenkins Runs Corresponding Test Pipelines
+
+Depending on the incoming parameters:
+
+Environment	Triggered Jenkins Pipeline
+Dev	Basic regression tests
+QA	Detailed regression tests
+Stage	Performance / load tests
+
+Pipelines can be parameterized based on:
+
+environment
+
+deployment ID
+
+pipeline ID
+
+Step 8 — Decision Point Inside Jenkins Pipeline
+
+Similar to your push model:
+
+IF FAIL:
+
+Jenkins can call Cloud Manager’s API to halt promotions or rollback.
+
+IF PASS:
+
+Jenkins marks the stage “passed” and allows promotion.
+
+(Cloud Manager API calls require the same Adobe service account.)
+
+Phase 3 — State Management & Repeatability
+Step 9 — Update Cursor and Processed Events
+
+After successfully triggering tests:
+
+Store the new Journaling cursor
+
+Store processed deployment IDs
+
+Ensures reliable, idempotent behavior.
+
+Step 10 — Idle State Handling
+
+Polling continues even if:
+
+There are no new deployments for days
+
+There are bursty deployments (e.g., 10 in 1 hour)
+
+Polling frequency is typically:
+
+Every 1–5 minutes for near-real-time
+
+Every 10–15 minutes for light load
+
+Adobe Journaling API supports up to 7 days of retention
+
+Security & Access Model
+Adobe Service Account Access
+
+To access the Journaling API:
+
+Use a Server-to-Server OAuth client or JWT-based service account created in Adobe Developer Console.
+
+Must be assigned to:
+
+Cloud Manager API
+
+I/O Events
+
+Correct Adobe Org & Project Workspace
+
+Cloud Manager administrators must approve access.
+
+Corporate Controls
+
+Outbound firewall rule: allow traffic from Polling Service → Adobe domain.
+
+No inbound opening required for Jenkins.
